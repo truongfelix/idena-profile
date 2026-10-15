@@ -1,0 +1,20 @@
+{
+  "name": "idena-profile",
+  "version": "0.1.0",
+  "description": "Idena profiles: a unique name, a bio and a picture per identity, and Trust, a public vouch counted per person and per topic",
+  "scripts": {
+    "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js",
+    "asbuild:debug": "asc assembly/index.ts --target debug",
+    "asbuild:release": "asc assembly/index.ts --target release",
+    "asbuild": "npm run asbuild:debug && npm run asbuild:release"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "assemblyscript": "^0.27.29",
+    "jest": "^29.7.0"
+  },
+  "type": "module",
+  "dependencies": {
+    "idena-sdk-as": "0.0.29"
+  }
+}
