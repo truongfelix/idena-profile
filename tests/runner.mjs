@@ -58,12 +58,13 @@ async function setStateNow(address, state) {
 
 let contract
 /** A call from `from`; {ok, errors, events, receipt}: ok only when the call and every callback succeeded. */
-async function call(from, method, arg = null) {
+async function call(from, method, arg = null, amount = '0') {
   const hash = await rpc('contract_call', [
     {
       from,
       contract,
       method,
+      amount,
       maxFee: '3000',
       args: arg === null ? [] : [{index: 0, format: 'string', value: JSON.stringify(arg)}],
     },
@@ -267,6 +268,138 @@ c = await call(dave, 'challengeName', {name: 'cache_holder'})
 check('a challenge uses the holder state read in this epoch', c.ok && (await read('c:', 'cache_holder')) === null, c.errors.join('; '))
 const costs = {first: gas(first), again: gas(laterCall)}
 console.log(`  gas: first call of an epoch ${costs.first}, later calls ${costs.again}`)
+
+// ---- 8. Vouched members
+console.log('\n== 8. Vouched members')
+const EXTRA = '300' // above 25,000 gas at the runner's 0.01 iDNA per gas
+await setEpoch(epoch + 1)
+const voucher = await account(S.Human)
+const member = await account()
+const stranger = await account()
+c = await call(member, 'acceptVouch', {voucher})
+check('accepting without an offer is refused', !c.ok, c.errors.join('; '))
+c = await call(voucher, 'vouch', {member})
+check('a Human offers a vouch', c.ok && (await read('o:', `${member}:${voucher}`)) === String(epoch), c.errors.join('; '))
+c = await call(member, 'claimName', {name: 'before_accept'}, EXTRA)
+check('an offer not accepted gives nothing', !c.ok, c.errors.join('; '))
+c = await call(member, 'acceptVouch', {voucher})
+check(
+  'the member accepts: vouched, the voucher has 1 member',
+  c.ok && (await read('v:', member)) === voucher && (await read('q:', voucher)) === '1' && (await read('o:', `${member}:${voucher}`)) === null,
+  c.errors.join('; ')
+)
+c = await call(member, 'claimName', {name: 'vouched_one'})
+check('a vouched member who sends nothing extra is refused', !c.ok, c.errors.join('; '))
+const contractBefore = Number(await rpc('chain_getBalance', [contract]))
+c = await call(member, 'claimName', {name: 'vouched_one'}, EXTRA)
+check('with the extra amount the vouched member claims a name', c.ok && (await read('n:', 'vouched_one')) === member, c.errors.join('; '))
+check('the extra amount is burned, not kept', Number(await rpc('chain_getBalance', [contract])) === contractBefore)
+c = await call(member, 'setProfile', {bio: 'New here, vouched for', picture: ''}, EXTRA)
+check('the vouched member writes a profile', c.ok && (await read('b:', member)) === 'New here, vouched for', c.errors.join('; '))
+const someone = await account(S.Human)
+c = await call(member, 'trust', {target: someone}, EXTRA)
+check(
+  'a vouched Trust counts apart (w:), not with identities (k:)',
+  c.ok && (await read('w:', someone)) === '1' && (await read('k:', someone)) === null && (await read('t:', `${someone}:${member}`)) === `${epoch}:v`,
+  c.errors.join('; ')
+)
+c = await call(member, 'vouch', {member: stranger})
+check('a vouched member cannot vouch', !c.ok, c.errors.join('; '))
+c = await call(member, 'untrust', {target: someone})
+check('untrust takes a vouched Trust back from w:', c.ok && (await read('w:', someone)) === null, c.errors.join('; '))
+
+await setEpoch(epoch + 1)
+c = await call(member, 'trust', {target: someone}, EXTRA)
+check('a new epoch: member and voucher read again in one call (two answers)', c.ok && (await read('w:', someone)) === '1', c.errors.join('; '))
+
+const human2 = await account(S.Human)
+c = await call(voucher, 'vouch', {member: human2})
+c = await call(human2, 'acceptVouch', {voucher})
+check('an account with an identity cannot be vouched for', !c.ok && (await read('v:', human2)) === null, c.errors.join('; '))
+const otherVoucher = await account(S.Human)
+await call(otherVoucher, 'vouch', {member})
+c = await call(member, 'acceptVouch', {voucher: otherVoucher})
+check('a member already vouched for cannot accept a second vouch', !c.ok && (await read('v:', member)) === voucher, c.errors.join('; '))
+
+console.log('-- offers that are not accepted')
+const wrong = await account()
+await call(voucher, 'vouch', {member: wrong})
+c = await call(stranger, 'cancelOffer', {member: wrong})
+check("a stranger cannot cancel someone else's offer", !c.ok && (await read('o:', `${wrong}:${voucher}`)) !== null, c.errors.join('; '))
+c = await call(voucher, 'cancelOffer', {member: wrong})
+check('the voucher cancels an offer', c.ok && (await read('o:', `${wrong}:${voucher}`)) === null, c.errors.join('; '))
+c = await call(wrong, 'acceptVouch', {voucher})
+check('a cancelled offer cannot be accepted', !c.ok && (await read('v:', wrong)) === null, c.errors.join('; '))
+await call(voucher, 'vouch', {member: wrong})
+c = await call(wrong, 'declineOffer', {voucher})
+check('the member declines an offer', c.ok && (await read('o:', `${wrong}:${voucher}`)) === null, c.errors.join('; '))
+const lone = await account(S.Newbie)
+const pending = [await account(), await account(), await account()]
+for (const m of pending) await call(lone, 'vouch', {member: m})
+check('offers take no slot: a Newbie (cap 1) may offer 3 at once', (await read('q:', lone)) === null && (await read('o:', `${pending[2]}:${lone}`)) !== null)
+c = await call(pending[0], 'acceptVouch', {voucher: lone})
+const c2 = await call(pending[1], 'acceptVouch', {voucher: lone})
+check('the first to accept takes the slot, the next is refused', c.ok && !c2.ok && (await read('q:', lone)) === '1', `${c.errors} ${c2.errors}`)
+
+console.log('-- caps: Newbie 1, Verified 3, Human 5')
+for (const [label, state, cap] of [['Newbie', S.Newbie, 1], ['Verified', S.Verified, 3], ['Human', S.Human, 5]]) {
+  const v = await account(state)
+  const accepted = []
+  for (let i = 0; i <= cap; i += 1) {
+    const m = await account()
+    await call(v, 'vouch', {member: m})
+    const r = await call(m, 'acceptVouch', {voucher: v})
+    if (r.ok) accepted.push(m)
+  }
+  check(`${label}: ${cap} accepted, the next refused`, accepted.length === cap && (await read('q:', v)) === String(cap), `${accepted.length} accepted`)
+  if (label === 'Newbie') {
+    await call(v, 'endVouch', {member: accepted[0]})
+    const m = await account()
+    await call(v, 'vouch', {member: m})
+    const r = await call(m, 'acceptVouch', {voucher: v})
+    check('Newbie: after ending a vouch, a slot is free again', r.ok && (await read('q:', v)) === '1', r.errors.join('; '))
+  }
+}
+
+console.log("-- the voucher's standing")
+await setState(voucher, S.Suspended)
+c = await call(member, 'trust', {target: otherVoucher}, EXTRA)
+check('voucher Suspended: the member can no longer act', !c.ok, c.errors.join('; '))
+c = await call(dave, 'challengeName', {name: 'vouched_one'})
+const memberChallenge = epoch
+check("voucher Suspended: the member's name can be challenged", (await read('c:', 'vouched_one')) === String(memberChallenge), c.errors.join('; '))
+await setState(voucher, S.Human)
+c = await call(dave, 'challengeName', {name: 'vouched_one'})
+check('voucher validated again: the challenge clears', (await read('c:', 'vouched_one')) === null, c.errors.join('; '))
+await call(voucher, 'endVouch', {member})
+check('the voucher ends the vouch: the member is no longer vouched', (await read('v:', member)) === null && (await read('q:', voucher)) === null)
+await call(dave, 'challengeName', {name: 'vouched_one'})
+const freedAt = epoch
+await setEpoch(freedAt + 2)
+c = await call(dave, 'releaseName', {name: 'vouched_one'})
+check("the ended member's name is freed after the grace", c.ok && (await read('n:', 'vouched_one')) === null, c.errors.join('; '))
+
+console.log('-- a member who gets an identity')
+const grows = await account()
+await call(voucher, 'vouch', {member: grows})
+await call(grows, 'acceptVouch', {voucher})
+check('vouched', (await read('v:', grows)) === voucher && (await read('q:', voucher)) === '1')
+await setState(grows, S.Newbie)
+c = await call(grows, 'claimName', {name: 'grew_up'}, EXTRA)
+check(
+  "validated: acts on its own identity and leaves the voucher's list (the slot is free)",
+  c.ok && (await read('v:', grows)) === null && (await read('q:', voucher)) === null && (await read('n:', 'grew_up')) === grows,
+  c.errors.join('; ')
+)
+c = await call(grows, 'trust', {target: someone})
+check('no extra amount needed any more', c.ok && (await read('k:', someone)) === '1', c.errors.join('; '))
+const leaver = await account()
+await call(voucher, 'vouch', {member: leaver})
+await call(leaver, 'acceptVouch', {voucher})
+c = await call(stranger, 'endVouch', {member: leaver})
+check("a stranger cannot end someone else's vouch", !c.ok && (await read('v:', leaver)) === voucher, c.errors.join('; '))
+c = await call(leaver, 'endVouch', {member: ''})
+check('a member may leave on its own', c.ok && (await read('v:', leaver)) === null, c.errors.join('; '))
 
 console.log(`\n${failures === 0 ? 'ALL PASSED' : `${failures} FAILED`} (${cases} checks)`)
 process.exitCode = failures === 0 ? 0 : 1

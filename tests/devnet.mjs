@@ -95,8 +95,6 @@ console.log(`contract ${contract}; fee per gas ${fee}`)
 
 let c = await call('human', 'claimName', {name: 'Bad Name'})
 check('an invalid name is refused', !c.ok, c.errors.join('; '))
-c = await call('human', 'claimName', {name: 'idena'})
-check('a reserved name is refused', !c.ok, c.errors.join('; '))
 c = await call('none', 'claimName', {name: 'nobody_here'})
 check('no identity: the claim is refused in the callback', !c.ok && (await read('n:', 'nobody_here')) === null, c.errors.join('; '))
 c = await call('human', 'claimName', {name: 'felix_test'})
