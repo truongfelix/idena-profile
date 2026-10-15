@@ -13,7 +13,8 @@
 //   a:<address>         -> its name
 //   r:<address>         -> epoch of its last name change
 //   x:<name>            -> epoch from which a dropped or renamed name can be claimed again
-//   c:<name>            -> epoch its holder was found without the right to hold it (challenge)
+//   c:<name>:<challenger> -> "<since>:<last>:<holder>": the challenger found the holder without the right to hold the
+//                          name in each epoch from <since> to <last>; from <since> + GRACE_EPOCHS it takes the name
 //   b:<address>         -> bio
 //   p:<address>         -> picture ("ipfs://<cid>")
 //   t:<target>:<giver>  -> epoch the Trust was given, then ":v" when given as a vouched member; target = an address
@@ -24,6 +25,7 @@
 //                          it; it takes no slot (the cap counts accepted vouches)
 //   v:<member>          -> its voucher, once accepted
 //   m:<voucher>:<member> -> epoch the member accepted; q:<voucher> -> how many members it vouches for
+//   e:<voucher>         -> "<epoch>:<count>": vouches it started in that epoch (at most its cap, ended ones included)
 //   i:<address>         -> "<epoch>:<state>": its identity state as read in that epoch
 import {Address, Bytes, Context, Host, Balance, PersistentMap, u128, util, models} from 'idena-sdk-as'
 import {Protobuf} from 'as-proto'
@@ -43,7 +45,10 @@ const IDENTITY_GAS: u32 = 20_000
 const DEFAULT_CALLBACK_GAS: u32 = 10_000_000
 const KEEP_STATE_GAS: u32 = 10_000_000
 
-/** Epochs a challenged holder has to come back before the name is freed. */
+/**
+ * Epochs a challenged holder has to come back: the challenger finds the holder without the right to hold the name in
+ * this many epochs after the first, each one in a row, then takes it.
+ */
 const GRACE_EPOCHS: u16 = 2
 /** Epochs a dropped or renamed name stays blocked. */
 const BLOCKED_EPOCHS: u16 = 2
@@ -142,6 +147,16 @@ function promisedState(): u32 {
   return identity.state
 }
 
+/** A call that needs no amount refuses one: the contract has no way to give it back. */
+function noPayment(): void {
+  util.assert(Context.payAmount().value.isZero(), 'this call takes no amount')
+}
+
+/** The first epoch of a saved challenge, "<since>:<last>:<holder>". */
+function challengeSince(saved: string): u16 {
+  return parseEpoch(saved.slice(0, saved.indexOf(':')))
+}
+
 /** What a vouched member sends with a call, burned: about one more call's fee. */
 function vouchedExtra(): Balance {
   return new Balance(u128.mul(Context.minFeePerGas().value, u128.fromU64(VOUCHED_EXTRA_GAS)))
@@ -178,44 +193,37 @@ const OWN: i32 = 1
 const VOUCHED: i32 = 2
 const NONE: i32 = 0
 
-export class IdenaProfile {
-  holders: PersistentMap<string, string>
-  names: PersistentMap<string, string>
-  renamed: PersistentMap<string, string>
-  blocked: PersistentMap<string, string>
-  challenges: PersistentMap<string, string>
-  bios: PersistentMap<string, string>
-  pictures: PersistentMap<string, string>
-  trusts: PersistentMap<string, string>
-  counts: PersistentMap<string, string>
-  vouchedCounts: PersistentMap<string, string>
-  offers: PersistentMap<string, string>
-  vouchers: PersistentMap<string, string>
-  members: PersistentMap<string, string>
-  memberCounts: PersistentMap<string, string>
-  identities: PersistentMap<string, string>
+/**
+ * The storage maps, built at each call: outside the contract object, which the SDK reads and writes whole at every
+ * call and callback (each map in it cost its prefix's bytes in each).
+ */
+class Maps {
+  holders: PersistentMap<string, string> = PersistentMap.withStringPrefix<string, string>('n:')
+  names: PersistentMap<string, string> = PersistentMap.withStringPrefix<string, string>('a:')
+  renamed: PersistentMap<string, string> = PersistentMap.withStringPrefix<string, string>('r:')
+  blocked: PersistentMap<string, string> = PersistentMap.withStringPrefix<string, string>('x:')
+  challenges: PersistentMap<string, string> = PersistentMap.withStringPrefix<string, string>('c:')
+  bios: PersistentMap<string, string> = PersistentMap.withStringPrefix<string, string>('b:')
+  pictures: PersistentMap<string, string> = PersistentMap.withStringPrefix<string, string>('p:')
+  trusts: PersistentMap<string, string> = PersistentMap.withStringPrefix<string, string>('t:')
+  counts: PersistentMap<string, string> = PersistentMap.withStringPrefix<string, string>('k:')
+  vouchedCounts: PersistentMap<string, string> = PersistentMap.withStringPrefix<string, string>('w:')
+  offers: PersistentMap<string, string> = PersistentMap.withStringPrefix<string, string>('o:')
+  vouchers: PersistentMap<string, string> = PersistentMap.withStringPrefix<string, string>('v:')
+  members: PersistentMap<string, string> = PersistentMap.withStringPrefix<string, string>('m:')
+  memberCounts: PersistentMap<string, string> = PersistentMap.withStringPrefix<string, string>('q:')
+  identities: PersistentMap<string, string> = PersistentMap.withStringPrefix<string, string>('i:')
+  epochVouches: PersistentMap<string, string> = PersistentMap.withStringPrefix<string, string>('e:')
+}
+const maps = new Maps()
 
-  constructor() {
-    this.holders = PersistentMap.withStringPrefix<string, string>('n:')
-    this.names = PersistentMap.withStringPrefix<string, string>('a:')
-    this.renamed = PersistentMap.withStringPrefix<string, string>('r:')
-    this.blocked = PersistentMap.withStringPrefix<string, string>('x:')
-    this.challenges = PersistentMap.withStringPrefix<string, string>('c:')
-    this.bios = PersistentMap.withStringPrefix<string, string>('b:')
-    this.pictures = PersistentMap.withStringPrefix<string, string>('p:')
-    this.trusts = PersistentMap.withStringPrefix<string, string>('t:')
-    this.counts = PersistentMap.withStringPrefix<string, string>('k:')
-    this.vouchedCounts = PersistentMap.withStringPrefix<string, string>('w:')
-    this.offers = PersistentMap.withStringPrefix<string, string>('o:')
-    this.vouchers = PersistentMap.withStringPrefix<string, string>('v:')
-    this.members = PersistentMap.withStringPrefix<string, string>('m:')
-    this.memberCounts = PersistentMap.withStringPrefix<string, string>('q:')
-    this.identities = PersistentMap.withStringPrefix<string, string>('i:')
-  }
+export class IdenaProfile {
+  /** Deploys the contract: it keeps no state of its own besides the maps. */
+  constructor() {}
 
   // ---- Names
 
-  /** Claims a free name, or renames (at most once per epoch; the old name stays blocked). */
+  /** Claims a free name, or renames (one name claimed per epoch; the old name stays blocked). */
   @mutateState
   claimName(args: NameArgs): void {
     this.checkFree(args.name)
@@ -234,49 +242,43 @@ export class IdenaProfile {
   /** Drops the caller's name; it stays blocked for a while. */
   @mutateState
   dropName(): void {
+    noPayment()
     const caller = Context.caller()
     const address = hex(caller)
-    const name = this.names.get(address, '')
+    const name = maps.names.get(address, '')
     util.assert(name != '', 'no name')
     this.release(name, Context.epoch())
-    this.names.delete(address)
+    maps.names.delete(address)
     Host.emitEvent('name', [caller.toBytes(), Bytes.fromString(''), Bytes.fromString(name)])
   }
 
   /**
-   * Records that the holder of `name` may no longer hold it (anyone may call it): neither validated nor vouched for
-   * by a validated identity. A holder in good standing clears it.
+   * Finds that the holder of `name` may no longer hold it: neither validated nor vouched for by a validated identity.
+   * The caller calls it once in each epoch, in a row; a holder found in good standing ends that challenge, and a
+   * missed epoch starts it again. From GRACE_EPOCHS after the first, the call frees the name and claims it for the
+   * caller (when the caller may claim a name in this epoch; else it only counts the epoch).
    */
   @mutateState
   challengeName(args: NameArgs): void {
-    const holderHex = this.holders.get(args.name, '')
+    const holderHex = maps.holders.get(args.name, '')
     util.assert(holderHex != '', 'no such name')
+    const caller = Context.caller()
+    util.assert(holderHex != hex(caller), 'cannot challenge oneself')
+    this.payIfVouched(caller)
     const holder = addressOf(holderHex)
-    if (this.ensureKnown(this.withVoucher(holder), '_challengeName', [holder.toBytes(), Bytes.fromString(args.name)], args._gas))
-      this.doChallengeName(holder, args.name)
+    const accounts = this.withVoucher(holder)
+    if (this.challengeEnds(args.name, hex(caller), holderHex)) {
+      const own = this.withVoucher(caller)
+      for (let i = 0; i < own.length; i++) accounts.push(own[i])
+    }
+    if (this.ensureKnown(accounts, '_challengeName', [caller.toBytes(), Bytes.fromString(args.name)], args._gas))
+      this.doChallengeName(caller, args.name)
   }
 
   @mutateState
-  _challengeName(asked: Address, holder: Address, name: string): void {
+  _challengeName(asked: Address, challenger: Address, name: string): void {
     this.keep(asked)
-    this.doChallengeName(holder, name)
-  }
-
-  /** Frees a challenged name GRACE_EPOCHS after the challenge if its holder still may not hold it. */
-  @mutateState
-  releaseName(args: NameArgs): void {
-    const since = this.challenges.get(args.name, '')
-    util.assert(since != '', 'not challenged')
-    util.assert(Context.epoch() >= parseEpoch(since) + GRACE_EPOCHS, 'the grace is not over')
-    const holder = addressOf(this.holders.get(args.name, ''))
-    if (this.ensureKnown(this.withVoucher(holder), '_releaseName', [holder.toBytes(), Bytes.fromString(args.name)], args._gas))
-      this.doReleaseName(holder, args.name)
-  }
-
-  @mutateState
-  _releaseName(asked: Address, holder: Address, name: string): void {
-    this.keep(asked)
-    this.doReleaseName(holder, name)
+    this.doChallengeName(challenger, name)
   }
 
   // ---- Profile
@@ -320,11 +322,12 @@ export class IdenaProfile {
   /** Takes a Trust back. */
   @mutateState
   untrust(args: TrustArgs): void {
+    noPayment()
     const caller = Context.caller()
     const key = args.target + ':' + hex(caller)
-    const given = this.trusts.get(key, '')
+    const given = maps.trusts.get(key, '')
     util.assert(given != '', 'not trusted')
-    this.trusts.delete(key)
+    maps.trusts.delete(key)
     this.addTrustCount(args.target, given.endsWith(':v'), -1)
     Host.emitEvent('untrust', [caller.toBytes(), Bytes.fromString(args.target)])
   }
@@ -334,10 +337,11 @@ export class IdenaProfile {
   /** Offers to vouch for `member`, an account without an identity; it becomes a vouch once the member accepts it. */
   @mutateState
   vouch(args: MemberArgs): void {
+    noPayment()
     util.assert(validAddress(args.member), 'not an address')
     const caller = Context.caller()
     util.assert(args.member != hex(caller), 'cannot vouch for oneself')
-    util.assert(this.vouchers.get(args.member, '') != hex(caller), 'already vouched for')
+    util.assert(maps.vouchers.get(args.member, '') != hex(caller), 'already vouched for')
     if (this.ensureKnown([caller], '_vouch', [caller.toBytes(), Bytes.fromString(args.member)], args._gas))
       this.doVouch(caller, args.member)
   }
@@ -351,10 +355,11 @@ export class IdenaProfile {
   /** Accepts a vouch offered to the caller. */
   @mutateState
   acceptVouch(args: VoucherArgs): void {
+    noPayment()
     util.assert(validAddress(args.voucher), 'not an address')
     const caller = Context.caller()
-    util.assert(this.offers.get(hex(caller) + ':' + args.voucher, '') != '', 'no such offer')
-    util.assert(this.vouchers.get(hex(caller), '') == '', 'already vouched for')
+    util.assert(maps.offers.get(hex(caller) + ':' + args.voucher, '') != '', 'no such offer')
+    util.assert(maps.vouchers.get(hex(caller), '') == '', 'already vouched for')
     const voucher = addressOf(args.voucher)
     if (this.ensureKnown([caller, voucher], '_acceptVouch', [caller.toBytes(), voucher.toBytes()], args._gas))
       this.doAcceptVouch(caller, voucher)
@@ -366,12 +371,17 @@ export class IdenaProfile {
     this.doAcceptVouch(member, voucher)
   }
 
-  /** Ends the vouch for `member` (by its voucher) or the caller's own (by the member, `member` empty). */
+  /**
+   * Ends the vouch for `member` (by its voucher) or the caller's own (by the member, `member` empty). As for an
+   * identity that lost its status, nothing is deleted: the apps stop showing its name, bio, picture and Trusts, which
+   * come back if it is vouched for again; its name can be challenged meanwhile.
+   */
   @mutateState
   endVouch(args: MemberArgs): void {
+    noPayment()
     const caller = hex(Context.caller())
     const member = args.member == '' ? caller : args.member
-    const voucher = this.vouchers.get(member, '')
+    const voucher = maps.vouchers.get(member, '')
     util.assert(voucher != '' && (caller == member || caller == voucher), 'no such vouch')
     this.removeVouch(member, voucher)
   }
@@ -379,20 +389,22 @@ export class IdenaProfile {
   /** The voucher withdraws an offer not accepted yet. An offer takes no slot: the cap counts accepted vouches. */
   @mutateState
   cancelOffer(args: MemberArgs): void {
+    noPayment()
     const caller = Context.caller()
     const key = args.member + ':' + hex(caller)
-    util.assert(this.offers.get(key, '') != '', 'no such offer')
-    this.offers.delete(key)
+    util.assert(maps.offers.get(key, '') != '', 'no such offer')
+    maps.offers.delete(key)
     Host.emitEvent('vouchOfferEnded', [caller.toBytes(), Bytes.fromString(args.member)])
   }
 
   /** The member refuses an offer. */
   @mutateState
   declineOffer(args: VoucherArgs): void {
+    noPayment()
     const caller = Context.caller()
     const key = hex(caller) + ':' + args.voucher
-    util.assert(this.offers.get(key, '') != '', 'no such offer')
-    this.offers.delete(key)
+    util.assert(maps.offers.get(key, '') != '', 'no such offer')
+    maps.offers.delete(key)
     Host.emitEvent('vouchOfferEnded', [Bytes.fromString(args.voucher), caller.toBytes()])
   }
 
@@ -403,49 +415,46 @@ export class IdenaProfile {
     this.checkFree(name)
     const address = hex(holder)
     const epoch = Context.epoch()
-    const old = this.names.get(address, '')
-    if (old != '') {
-      util.assert(parseEpoch(this.renamed.get(address, '0')) < epoch, 'one name change per epoch')
-      this.release(old, epoch)
-    }
-    this.holders.set(name, address)
-    this.names.set(address, name)
-    this.renamed.set(address, epochText(epoch))
+    const last = maps.renamed.get(address, '')
+    util.assert(last == '' || parseEpoch(last) < epoch, 'one name change per epoch')
+    const old = maps.names.get(address, '')
+    if (old != '') this.release(old, epoch)
+    maps.holders.set(name, address)
+    maps.names.set(address, name)
+    maps.renamed.set(address, epochText(epoch))
     Host.emitEvent('name', [holder.toBytes(), Bytes.fromString(name), Bytes.fromString(old)])
   }
 
-  private doChallengeName(holder: Address, name: string): void {
+  private doChallengeName(challenger: Address, name: string): void {
+    const holderHex = maps.holders.get(name, '')
+    const holder = addressOf(holderHex)
+    const key = name + ':' + hex(challenger)
     if (this.standing(holder, false) != NONE) {
-      this.challenges.delete(name)
-      Host.emitEvent('challenge', [Bytes.fromString(name), Bytes.fromString('')])
+      maps.challenges.delete(key)
+      Host.emitEvent('challenge', [Bytes.fromString(name), challenger.toBytes(), Bytes.fromString('')])
       return
     }
-    if (this.challenges.get(name, '') == '') {
-      const epoch = epochText(Context.epoch())
-      this.challenges.set(name, epoch)
-      Host.emitEvent('challenge', [Bytes.fromString(name), Bytes.fromString(epoch)])
-    }
-  }
-
-  private doReleaseName(holder: Address, name: string): void {
-    this.challenges.delete(name)
-    if (this.standing(holder, false) != NONE) {
-      Host.emitEvent('challenge', [Bytes.fromString(name), Bytes.fromString('')])
-      return
-    }
-    this.holders.delete(name)
-    this.names.delete(hex(holder))
-    Host.emitEvent('released', [Bytes.fromString(name), Bytes.fromString(hex(holder))])
+    const epoch = Context.epoch()
+    const ends = this.challengeEnds(name, hex(challenger), holderHex)
+    const since = this.challengeGoesOn(name, hex(challenger), holderHex) ? challengeSince(maps.challenges.get(key, '')) : epoch
+    maps.challenges.set(key, epochText(since) + ':' + epochText(epoch) + ':' + holderHex)
+    Host.emitEvent('challenge', [Bytes.fromString(name), challenger.toBytes(), Bytes.fromString(epochText(since))])
+    if (!ends || !this.mayClaim(challenger)) return
+    maps.challenges.delete(key)
+    maps.holders.delete(name)
+    maps.names.delete(holderHex)
+    Host.emitEvent('released', [Bytes.fromString(name), Bytes.fromString(holderHex)])
+    this.doClaimName(challenger, name)
   }
 
   private doSetProfile(holder: Address, bio: string, picture: string): void {
     util.assert(this.standing(holder, false) != NONE, 'neither validated nor vouched for')
     this.checkProfile(bio, picture)
     const address = hex(holder)
-    if (bio == '') this.bios.delete(address)
-    else this.bios.set(address, bio)
-    if (picture == '') this.pictures.delete(address)
-    else this.pictures.set(address, picture)
+    if (bio == '') maps.bios.delete(address)
+    else maps.bios.set(address, bio)
+    if (picture == '') maps.pictures.delete(address)
+    else maps.pictures.set(address, picture)
     Host.emitEvent('profile', [holder.toBytes(), Bytes.fromString(bio), Bytes.fromString(picture)])
   }
 
@@ -453,9 +462,9 @@ export class IdenaProfile {
     const standing = this.standing(giver, true)
     util.assert(standing != NONE, 'neither validated nor vouched for')
     const key = target + ':' + hex(giver)
-    util.assert(this.trusts.get(key, '') == '', 'already trusted')
+    util.assert(maps.trusts.get(key, '') == '', 'already trusted')
     const asMember = standing == VOUCHED
-    this.trusts.set(key, epochText(Context.epoch()) + (asMember ? ':v' : ''))
+    maps.trusts.set(key, epochText(Context.epoch()) + (asMember ? ':v' : ''))
     this.addTrustCount(target, asMember, 1)
     Host.emitEvent('trust', [giver.toBytes(), Bytes.fromString(target), Bytes.fromString(asMember ? 'vouched' : '')])
   }
@@ -463,9 +472,9 @@ export class IdenaProfile {
   private doVouch(voucher: Address, member: string): void {
     const state = this.stateOf(voucher)
     util.assert(validated(state), 'only a validated identity vouches')
-    const count = U32.parseInt(this.memberCounts.get(hex(voucher), '0'))
+    const count = U32.parseInt(maps.memberCounts.get(hex(voucher), '0'))
     util.assert(count < vouchCap(state), 'no vouch left')
-    this.offers.set(member + ':' + hex(voucher), epochText(Context.epoch()))
+    maps.offers.set(member + ':' + hex(voucher), epochText(Context.epoch()))
     Host.emitEvent('vouchOffered', [voucher.toBytes(), Bytes.fromString(member)])
   }
 
@@ -473,12 +482,16 @@ export class IdenaProfile {
     util.assert(vouchable(this.stateOf(member)), 'only an account without an identity can be vouched for')
     const voucherState = this.stateOf(voucher)
     util.assert(validated(voucherState), 'the voucher is not validated')
-    const count = U32.parseInt(this.memberCounts.get(hex(voucher), '0'))
+    const count = U32.parseInt(maps.memberCounts.get(hex(voucher), '0'))
     util.assert(count < vouchCap(voucherState), 'the voucher has no vouch left')
-    this.offers.delete(hex(member) + ':' + hex(voucher))
-    this.vouchers.set(hex(member), hex(voucher))
-    this.members.set(hex(voucher) + ':' + hex(member), epochText(Context.epoch()))
-    this.memberCounts.set(hex(voucher), (count + 1).toString())
+    const epoch = Context.epoch()
+    const started = this.vouchesThisEpoch(hex(voucher))
+    util.assert(started < vouchCap(voucherState), 'the voucher has no vouch left in this epoch')
+    maps.epochVouches.set(hex(voucher), epochText(epoch) + ':' + (started + 1).toString())
+    maps.offers.delete(hex(member) + ':' + hex(voucher))
+    maps.vouchers.set(hex(member), hex(voucher))
+    maps.members.set(hex(voucher) + ':' + hex(member), epochText(Context.epoch()))
+    maps.memberCounts.set(hex(voucher), (count + 1).toString())
     Host.emitEvent('vouched', [voucher.toBytes(), member.toBytes()])
   }
 
@@ -491,7 +504,7 @@ export class IdenaProfile {
    */
   private standing(account: Address, forTrust: bool): i32 {
     const state = this.stateOf(account)
-    const voucher = this.vouchers.get(hex(account), '')
+    const voucher = maps.vouchers.get(hex(account), '')
     if (voucher != '' && !vouchable(state)) this.removeVouch(hex(account), voucher)
     if (forTrust ? canTrust(state) : validated(state)) return OWN
     if (voucher != '' && vouchable(state) && validated(this.stateOf(addressOf(voucher)))) return VOUCHED
@@ -501,7 +514,7 @@ export class IdenaProfile {
   /** The account, and its voucher if it has one: the states its standing needs. */
   private withVoucher(account: Address): Address[] {
     const list: Address[] = [account]
-    const voucher = this.vouchers.get(hex(account), '')
+    const voucher = maps.vouchers.get(hex(account), '')
     if (voucher != '') list.push(addressOf(voucher))
     return list
   }
@@ -511,25 +524,61 @@ export class IdenaProfile {
    * about one more call's fee.
    */
   private payIfVouched(account: Address): void {
-    if (this.vouchers.get(hex(account), '') == '') return
+    if (maps.vouchers.get(hex(account), '') == '') {
+      noPayment()
+      return
+    }
     const state = this.knownState(account)
-    if (state >= 0 && !vouchable(<u32>state)) return
+    if (state >= 0 && !vouchable(<u32>state)) {
+      noPayment()
+      return
+    }
     const paid = Context.payAmount()
     util.assert(paid >= vouchedExtra(), 'a vouched member sends about one more fee with each call')
     Host.burn(paid)
   }
 
+  /** The challenge of `challenger` on `name` counts the previous epoch for the same holder: it goes on. */
+  private challengeGoesOn(name: string, challenger: string, holder: string): bool {
+    const saved = maps.challenges.get(name + ':' + challenger, '')
+    if (saved == '') return false
+    const parts = saved.split(':')
+    return parts.length == 3 && parts[2] == holder && <i32>parseEpoch(parts[1]) + 1 >= <i32>Context.epoch()
+  }
+
+  /** This epoch's finding ends the challenge: it goes on, and the grace is over. */
+  private challengeEnds(name: string, challenger: string, holder: string): bool {
+    if (!this.challengeGoesOn(name, challenger, holder)) return false
+    const since = challengeSince(maps.challenges.get(name + ':' + challenger, ''))
+    return <i32>Context.epoch() >= <i32>since + <i32>GRACE_EPOCHS
+  }
+
+  /** The account (its states read) may claim a name now: in good standing, no name claimed in this epoch. */
+  private mayClaim(account: Address): bool {
+    if (this.knownState(account) < 0 || this.standing(account, false) == NONE) return false
+    const last = maps.renamed.get(hex(account), '')
+    return last == '' || parseEpoch(last) < Context.epoch()
+  }
+
+  /** How many vouches `voucher` started in this epoch (ended ones included). */
+  private vouchesThisEpoch(voucher: string): u32 {
+    const saved = maps.epochVouches.get(voucher, '')
+    const colon = saved.indexOf(':')
+    if (colon < 0 || parseEpoch(saved.slice(0, colon)) != Context.epoch()) return 0
+    return U32.parseInt(saved.slice(colon + 1))
+  }
+
   private removeVouch(member: string, voucher: string): void {
-    this.vouchers.delete(member)
-    this.members.delete(voucher + ':' + member)
-    const left = plus(this.memberCounts.get(voucher, '0'), -1)
-    if (left == '') this.memberCounts.delete(voucher)
-    else this.memberCounts.set(voucher, left)
+    maps.vouchers.delete(member)
+    maps.members.delete(voucher + ':' + member)
+    const left = plus(maps.memberCounts.get(voucher, '0'), -1)
+    if (left == '') maps.memberCounts.delete(voucher)
+    else maps.memberCounts.set(voucher, left)
     Host.emitEvent('vouchEnded', [Bytes.fromString(voucher), Bytes.fromString(member)])
   }
 
   private addTrustCount(target: string, asMember: bool, delta: i64): void {
-    const counts = asMember ? this.vouchedCounts : this.counts
+    const counts = asMember ? maps.vouchedCounts : maps.counts
     const next = plus(counts.get(target, '0'), delta)
     if (next == '') counts.delete(target)
     else counts.set(target, next)
@@ -543,7 +592,11 @@ export class IdenaProfile {
    */
   private ensureKnown(accounts: Address[], callback: string, args: Bytes[], gas: u32): bool {
     const unknown: Address[] = []
-    for (let i = 0; i < accounts.length; i++) if (this.knownState(accounts[i]) < 0) unknown.push(accounts[i])
+    for (let i = 0; i < accounts.length; i++) {
+      let again = false
+      for (let j = 0; j < i; j++) if (hex(accounts[j]) == hex(accounts[i])) again = true
+      if (!again && this.knownState(accounts[i]) < 0) unknown.push(accounts[i])
+    }
     if (unknown.length == 0) return true
     for (let i = 0; i < unknown.length; i++) {
       const last = i == unknown.length - 1
@@ -570,7 +623,7 @@ export class IdenaProfile {
    * except a termination in the middle of one: a terminated identity keeps its state here until the epoch ends.
    */
   private knownState(address: Address): i32 {
-    const saved = this.identities.get(hex(address), '')
+    const saved = maps.identities.get(hex(address), '')
     const colon = saved.indexOf(':')
     if (colon < 0 || parseEpoch(saved.slice(0, colon)) != Context.epoch()) return -1
     return <i32>U32.parseInt(saved.slice(colon + 1))
@@ -585,15 +638,15 @@ export class IdenaProfile {
 
   /** Keeps the state the identity promise gave for `address` for the rest of the epoch. */
   private keep(address: Address): void {
-    this.identities.set(hex(address), epochText(Context.epoch()) + ':' + promisedState().toString())
+    maps.identities.set(hex(address), epochText(Context.epoch()) + ':' + promisedState().toString())
   }
 
   // ---- Checks
 
   private checkFree(name: string): void {
     util.assert(validName(name, 20), 'a-z, 0-9 and _, 3 to 20 characters')
-    util.assert(this.holders.get(name, '') == '', 'name taken')
-    const until = this.blocked.get(name, '')
+    util.assert(maps.holders.get(name, '') == '', 'name taken')
+    const until = maps.blocked.get(name, '')
     util.assert(until == '' || Context.epoch() >= parseEpoch(until), 'name blocked for now')
   }
 
@@ -605,9 +658,9 @@ export class IdenaProfile {
     )
   }
 
+  /** A dropped, renamed or forfeited name: free, blocked for a while. Challenges on it end with the holder's change. */
   private release(name: string, epoch: u16): void {
-    this.holders.delete(name)
-    this.challenges.delete(name)
-    this.blocked.set(name, epochText(epoch + BLOCKED_EPOCHS))
+    maps.holders.delete(name)
+    maps.blocked.set(name, epochText(epoch + BLOCKED_EPOCHS))
   }
 }

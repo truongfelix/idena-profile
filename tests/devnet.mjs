@@ -133,9 +133,7 @@ c = await call('human', 'untrust', {target: addr.none})
 check('untrusting twice is refused', !c.ok, c.errors.join('; '))
 
 c = await call('none', 'challengeName', {name: 'felix_test'})
-check('a challenge of a validated holder records nothing', c.ok && (await read('c:', 'felix_test')) === null, c.events.join(','))
-c = await call('none', 'releaseName', {name: 'felix_test'})
-check('releasing an unchallenged name is refused', !c.ok, c.errors.join('; '))
+check('a challenge of a validated holder records nothing', c.ok && (await read('c:', `felix_test:${addr.none}`)) === null, c.events.join(','))
 
 c = await call('human', 'dropName', null)
 check('the holder drops the name', c.ok && (await read('n:', 'felix_test')) === null && (await read('x:', 'felix_test')) === '2', c.events.join(','))

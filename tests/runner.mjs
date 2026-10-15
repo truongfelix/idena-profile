@@ -94,7 +94,9 @@ async function read(map, key) {
 // ---- Deploy
 const god = (await rpc('chain_god')).toLowerCase()
 const code = fs.readFileSync(new URL('../build/release/idena-profile.wasm', import.meta.url))
-const deployHash = await rpc('contract_deploy', [{from: god, code: `0x${code.toString('hex')}`, maxFee: '9000'}])
+// A random nonce: a fresh contract on each run (the runner keeps its chain between runs).
+const nonce = `0x${[...crypto.getRandomValues(new Uint8Array(8))].map((b) => b.toString(16).padStart(2, '0')).join('')}`
+const deployHash = await rpc('contract_deploy', [{from: god, code: `0x${code.toString('hex')}`, maxFee: '9000', nonce}])
 await block()
 contract = (await rpc('chain_txReceipt', [deployHash])).contract
 console.log(`contract ${contract} (${code.length} bytes)`)
@@ -159,61 +161,125 @@ c = await call(alice, 'claimName', {name: 'alice_three'})
 check('epoch 15: Alice claims it again', c.ok && (await read('a:', alice)) === 'alice_three', c.errors.join('; '))
 
 // ---- 4. Freeing the name of a holder who stopped validating
-console.log('\n== 4. Challenge and release')
+console.log('\n== 4. Challenge: the holder found without the right in 3 epochs in a row, then the challenger takes the name')
 const dave = await account(S.Newbie)
+const key = (name, who) => `${name}:${who}`
+const has = (r, reason) => !r.ok && r.errors.join(' ').includes(reason)
 for (const lost of [S.Zombie, S.Suspended, S.Killed, S.Undefined]) {
   const label = stateName[lost]
   const holder = await account(S.Human)
+  const challenger = await account(S.Newbie)
   const handle = `held_${label.toLowerCase()}`
   await call(holder, 'claimName', {name: handle})
   await setEpoch(epoch + 1)
-  c = await call(dave, 'challengeName', {name: handle})
-  check(`${label}: a challenge of a validated holder records nothing`, c.ok && (await read('c:', handle)) === null, c.errors.join('; '))
+  c = await call(challenger, 'challengeName', {name: handle})
+  check(`${label}: a challenge of a validated holder records nothing`, c.ok && (await read('c:', key(handle, challenger))) === null, c.errors.join('; '))
   await setState(holder, lost)
   const start = epoch
-  c = await call(dave, 'challengeName', {name: handle})
-  check(`${label}: the holder is ${label}: the challenge is recorded at epoch ${start}`, (await read('c:', handle)) === String(start), c.errors.join('; '))
+  c = await call(challenger, 'challengeName', {name: handle})
+  check(`${label}: the holder is ${label}: the challenge starts at epoch ${start}`, c.ok && (await read('c:', key(handle, challenger))) === `${start}:${start}:${holder}`, c.errors.join('; '))
   await setEpoch(start + 1)
-  await call(dave, 'challengeName', {name: handle})
-  check(`${label}: a second challenge keeps the first epoch`, (await read('c:', handle)) === String(start))
-  c = await call(dave, 'releaseName', {name: handle})
-  check(`${label}: epoch ${start + 1}: release refused, the grace is not over`, !c.ok && (await read('n:', handle)) === holder, c.errors.join('; '))
-  await setEpoch(start + 2)
-  c = await call(dave, 'releaseName', {name: handle})
+  c = await call(challenger, 'challengeName', {name: handle})
   check(
-    `${label}: epoch ${start + 2}: released; the name and the holder's link are gone`,
-    c.ok && (await read('n:', handle)) === null && (await read('a:', holder)) === null && (await read('c:', handle)) === null,
+    `${label}: epoch ${start + 1}: the challenge goes on, the name stays`,
+    c.ok && (await read('c:', key(handle, challenger))) === `${start}:${start + 1}:${holder}` && (await read('n:', handle)) === holder,
     c.errors.join('; ')
   )
-  if (lost === S.Zombie) {
-    c = await call(dave, 'claimName', {name: handle})
-    check(`${label}: anyone validated may claim the freed name (no block after a release)`, c.ok && (await read('n:', handle)) === dave, c.errors.join('; '))
-  }
+  await setEpoch(start + 2)
+  c = await call(challenger, 'challengeName', {name: handle})
+  check(
+    `${label}: epoch ${start + 2}: the challenger takes the name, the holder's link is gone`,
+    c.ok && (await read('n:', handle)) === challenger && (await read('a:', challenger)) === handle && (await read('a:', holder)) === null &&
+      (await read('c:', key(handle, challenger))) === null,
+    c.errors.join('; ')
+  )
 }
 
-console.log('\n== 5. A holder who validates again keeps the name')
+console.log('\n== 5. A validation between two findings ends the challenge')
 const erin = await account(S.Verified)
 await call(erin, 'claimName', {name: 'erin'})
 await setState(erin, S.Suspended)
-await call(dave, 'challengeName', {name: 'erin'})
-const since = epoch
-check('Erin is Suspended: challenged', (await read('c:', 'erin')) === String(since))
+let since = epoch
+c = await call(dave, 'challengeName', {name: 'erin'})
+check('Erin is Suspended: challenged', (await read('c:', key('erin', dave))) === `${since}:${since}:${erin}`, c.errors.join('; '))
 await setState(erin, S.Verified)
-await setEpoch(since + 2)
-c = await call(dave, 'releaseName', {name: 'erin'})
-check('Erin validated again: the release keeps her name and clears the challenge', (await read('n:', 'erin')) === erin && (await read('c:', 'erin')) === null, c.errors.join('; '))
-c = await call(dave, 'releaseName', {name: 'erin'})
-check('a second release is refused: nothing challenged', !c.ok, c.errors.join('; '))
+c = await call(dave, 'challengeName', {name: 'erin'})
+check('Erin validated again: the call ends the challenge, she keeps her name', c.ok && (await read('c:', key('erin', dave))) === null && (await read('n:', 'erin')) === erin, c.errors.join('; '))
 await setState(erin, S.Suspended)
 await call(dave, 'challengeName', {name: 'erin'})
-const again = epoch
 await setState(erin, S.Verified)
+await setState(erin, S.Suspended)
+c = await call(dave, 'challengeName', {name: 'erin'})
+check(
+  'validated in the epoch the challenger skipped: the challenge starts again, she keeps her name',
+  c.ok && (await read('n:', 'erin')) === erin && (await read('c:', key('erin', dave))) === `${epoch}:${epoch}:${erin}`,
+  c.errors.join('; ')
+)
+await setState(erin, S.Verified)
+await setEpoch(epoch + 20)
+await setState(erin, S.Suspended)
+c = await call(dave, 'challengeName', {name: 'erin'})
+check(
+  'a challenge from 20 epochs before gives no head start: it starts again',
+  c.ok && (await read('n:', 'erin')) === erin && (await read('c:', key('erin', dave))) === `${epoch}:${epoch}:${erin}`,
+  c.errors.join('; ')
+)
+console.log('-- another challenger cannot finish it')
+const frank = await account(S.Newbie)
+since = epoch
+await setEpoch(since + 1)
 await call(dave, 'challengeName', {name: 'erin'})
-check('a challenge while she is validated again clears it at once', (await read('c:', 'erin')) === null)
-check('(the challenge started at epoch ' + again + ' is gone)', (await read('n:', 'erin')) === erin)
-
+await setEpoch(since + 2)
+c = await call(frank, 'challengeName', {name: 'erin'})
+check("Frank's call starts his own challenge; the name stays", c.ok && (await read('n:', 'erin')) === erin && (await read('c:', key('erin', frank))) === `${epoch}:${epoch}:${erin}`, c.errors.join('; '))
+c = await call(dave, 'challengeName', {name: 'erin'})
+check('Dave, 3 epochs in a row, takes the name', c.ok && (await read('n:', 'erin')) === dave, c.errors.join('; '))
+c = await call(dave, 'challengeName', {name: 'erin'})
+check('challenging oneself is refused', has(c, 'cannot challenge oneself'), c.errors.join('; '))
 c = await call(dave, 'challengeName', {name: 'nobody_has_it'})
-check('challenging a name nobody holds is refused', !c.ok, c.errors.join('; '))
+check('challenging a name nobody holds is refused', has(c, 'no such name'), c.errors.join('; '))
+console.log('-- a challenger who cannot claim in that epoch')
+const gail = await account(S.Verified)
+const hugo = await account(S.Newbie)
+await call(gail, 'claimName', {name: 'gail'})
+await setState(gail, S.Suspended)
+since = epoch
+await call(hugo, 'challengeName', {name: 'gail'})
+await setEpoch(since + 1)
+await call(hugo, 'challengeName', {name: 'gail'})
+await setEpoch(since + 2)
+await call(hugo, 'claimName', {name: 'hugo_first'})
+c = await call(hugo, 'challengeName', {name: 'gail'})
+check(
+  'the challenger already claimed a name in this epoch: the call counts the epoch, the name stays',
+  c.ok && (await read('n:', 'gail')) === gail && (await read('c:', key('gail', hugo))) === `${since}:${since + 2}:${gail}`,
+  c.errors.join('; ')
+)
+await setEpoch(since + 3)
+c = await call(hugo, 'challengeName', {name: 'gail'})
+check('the next epoch it takes the name', c.ok && (await read('n:', 'gail')) === hugo && (await read('x:', 'hugo_first')) !== null, c.errors.join('; '))
+
+console.log('\n== 5b. One name claimed per epoch, a drop included')
+const ivy = await account(S.Human)
+await setEpoch(epoch + 1)
+await call(ivy, 'claimName', {name: 'ivy_one'})
+await setEpoch(epoch + 1)
+c = await call(ivy, 'claimName', {name: 'ivy_two'})
+check('a rename', c.ok && (await read('a:', ivy)) === 'ivy_two', c.errors.join('; '))
+c = await call(ivy, 'dropName')
+check('a drop', c.ok && (await read('a:', ivy)) === null, c.errors.join('; '))
+c = await call(ivy, 'claimName', {name: 'ivy_three'})
+check('a second claim in the same epoch, after the drop, is refused', has(c, 'one name change per epoch') && (await read('n:', 'ivy_three')) === null, c.errors.join('; '))
+
+console.log('\n== 5c. An amount a call does not need is refused')
+const before5c = await rpc('chain_getBalance', [contract])
+c = await call(ivy, 'claimName', {name: 'ivy_paid'}, '1')
+check('a validated identity sending an amount with a claim is refused', has(c, 'takes no amount'), c.errors.join('; '))
+for (const [method, arg] of [['trust', {target: dave}], ['setProfile', {bio: 'x', picture: ''}], ['vouch', {member: frank}], ['untrust', {target: dave}], ['dropName', null]]) {
+  c = await call(ivy, method, arg, '1')
+  check(`${method} with an amount is refused`, has(c, 'takes no amount'), c.errors.join('; '))
+}
+check('the contract kept nothing', (await rpc('chain_getBalance', [contract])) === before5c)
 
 // ---- 6. Trust when the giver changes state
 console.log('\n== 6. Trust over a giver\'s life')
@@ -265,7 +331,7 @@ check('a refused call keeps nothing: the next one asks again', !c.ok && (await r
 const holderC = await account(S.Human)
 await call(holderC, 'claimName', {name: 'cache_holder'})
 c = await call(dave, 'challengeName', {name: 'cache_holder'})
-check('a challenge uses the holder state read in this epoch', c.ok && (await read('c:', 'cache_holder')) === null, c.errors.join('; '))
+check('a challenge uses the holder state read in this epoch', c.ok && (await read('c:', key('cache_holder', dave))) === null, c.errors.join('; '))
 const costs = {first: gas(first), again: gas(laterCall)}
 console.log(`  gas: first call of an epoch ${costs.first}, later calls ${costs.again}`)
 
@@ -356,8 +422,11 @@ for (const [label, state, cap] of [['Newbie', S.Newbie, 1], ['Verified', S.Verif
     await call(v, 'endVouch', {member: accepted[0]})
     const m = await account()
     await call(v, 'vouch', {member: m})
-    const r = await call(m, 'acceptVouch', {voucher: v})
-    check('Newbie: after ending a vouch, a slot is free again', r.ok && (await read('q:', v)) === '1', r.errors.join('; '))
+    let r = await call(m, 'acceptVouch', {voucher: v})
+    check('Newbie: a vouch ended, but its 1 vouch of this epoch is used: refused', has(r, 'no vouch left in this epoch') && (await read('q:', v)) === null, r.errors.join('; '))
+    await setEpoch(epoch + 1)
+    r = await call(m, 'acceptVouch', {voucher: v})
+    check('the next epoch the slot is free again', r.ok && (await read('q:', v)) === '1', r.errors.join('; '))
   }
 }
 
@@ -367,17 +436,27 @@ c = await call(member, 'trust', {target: otherVoucher}, EXTRA)
 check('voucher Suspended: the member can no longer act', !c.ok, c.errors.join('; '))
 c = await call(dave, 'challengeName', {name: 'vouched_one'})
 const memberChallenge = epoch
-check("voucher Suspended: the member's name can be challenged", (await read('c:', 'vouched_one')) === String(memberChallenge), c.errors.join('; '))
+check("voucher Suspended: the member's name can be challenged", (await read('c:', key('vouched_one', dave))) === `${memberChallenge}:${memberChallenge}:${member}`, c.errors.join('; '))
 await setState(voucher, S.Human)
 c = await call(dave, 'challengeName', {name: 'vouched_one'})
-check('voucher validated again: the challenge clears', (await read('c:', 'vouched_one')) === null, c.errors.join('; '))
+check('voucher validated again: the challenge ends', c.ok && (await read('c:', key('vouched_one', dave))) === null, c.errors.join('; '))
 await call(voucher, 'endVouch', {member})
 check('the voucher ends the vouch: the member is no longer vouched', (await read('v:', member)) === null && (await read('q:', voucher)) === null)
-await call(dave, 'challengeName', {name: 'vouched_one'})
+check(
+  'ending a vouch deletes nothing: name, bio and Trust stay stored (the apps stop showing them)',
+  (await read('n:', 'vouched_one')) === member && (await read('b:', member)) === 'New here, vouched for' && (await read('t:', `${someone}:${member}`)) !== null
+)
+c = await call(member, 'setProfile', {bio: 'still here', picture: ''}, EXTRA)
+check('the ex-member is no member: the extra amount is refused', has(c, 'takes no amount'), c.errors.join('; '))
+c = await call(member, 'setProfile', {bio: 'still here', picture: ''})
+check('the ex-member can no longer act', has(c, 'neither validated nor vouched for') && (await read('b:', member)) === 'New here, vouched for', c.errors.join('; '))
 const freedAt = epoch
+await call(dave, 'challengeName', {name: 'vouched_one'})
+await setEpoch(freedAt + 1)
+await call(dave, 'challengeName', {name: 'vouched_one'})
 await setEpoch(freedAt + 2)
-c = await call(dave, 'releaseName', {name: 'vouched_one'})
-check("the ended member's name is freed after the grace", c.ok && (await read('n:', 'vouched_one')) === null, c.errors.join('; '))
+c = await call(dave, 'challengeName', {name: 'vouched_one'})
+check("the ex-member's name goes to its challenger after 3 epochs in a row", c.ok && (await read('n:', 'vouched_one')) === dave, c.errors.join('; '))
 
 console.log('-- a member who gets an identity')
 const grows = await account()
