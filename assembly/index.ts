@@ -2,8 +2,7 @@
 // counted per person and per topic. No owner and no upgrade: a later version lives at another address.
 //
 // The identity of an address is read with a promise (the node answers it after the call): each method that needs
-// it asks for it, and its callback checks the state and writes. A callback acts only on a promise's answer: called
-// any other way it sees no value and refuses.
+// it asks for it, and its callback checks the state and writes. The VM runs a callback only as a promise's answer.
 //
 // Storage, every value a string (contract_readMap / contract_iterateMap with the "string" format):
 //   n:<name>          -> holder address (0x..., lowercase)
@@ -19,6 +18,7 @@ import {Address, Bytes, Context, Host, Balance, PersistentMap, util, models} fro
 import {Protobuf} from 'as-proto'
 
 // Identity states (idena-go core/state).
+const UNDEFINED: u32 = 0
 const VERIFIED: u32 = 3
 const SUSPENDED: u32 = 4
 const ZOMBIE: u32 = 6
@@ -87,10 +87,16 @@ function parseEpoch(text: string): u16 {
   return <u16>U32.parseInt(text)
 }
 
-/** The identity a callback was given; aborts when it was not called with a promise's answer. */
+/**
+ * The identity state a callback was given. The node answers "empty" for an address without an identity, Killed
+ * ones included (idena-go deletes them): that is Undefined, so that the name of a Killed holder can be freed. The
+ * VM refuses a direct call to a callback ("direct call to promise callback is forbidden"): only our own promises
+ * reach here.
+ */
 function promisedState(): u32 {
   const res = Host.promiseResult()
-  util.assert(!res.failed() && !res.empty() && res.value().length > 0, 'no identity')
+  util.assert(!res.failed(), 'the identity could not be read')
+  if (res.empty() || res.value().length == 0) return UNDEFINED
   const identity = Protobuf.decode<models.ProtoStateIdentity>(res.value(), models.ProtoStateIdentity.decode)
   return identity.state
 }
