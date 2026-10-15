@@ -14,6 +14,8 @@
 //   p:<address>       -> picture ("ipfs://<cid>")
 //   t:<target>:<giver> -> epoch the Trust was given; target = an address or "r/<topic>"
 //   k:<target>        -> number of Trusts given to it (the apps count only givers still validated)
+//   i:<address>       -> "<epoch>:<state>": its identity state as read in that epoch; a later call in the same epoch
+//                        uses it instead of asking again
 import {Address, Bytes, Context, Host, Balance, PersistentMap, util, models} from 'idena-sdk-as'
 import {Protobuf} from 'as-proto'
 
@@ -131,6 +133,7 @@ export class IdenaProfile {
   pictures: PersistentMap<string, string>
   trusts: PersistentMap<string, string>
   counts: PersistentMap<string, string>
+  identities: PersistentMap<string, string>
 
   constructor() {
     this.holders = PersistentMap.withStringPrefix<string, string>('n:')
@@ -142,6 +145,7 @@ export class IdenaProfile {
     this.pictures = PersistentMap.withStringPrefix<string, string>('p:')
     this.trusts = PersistentMap.withStringPrefix<string, string>('t:')
     this.counts = PersistentMap.withStringPrefix<string, string>('k:')
+    this.identities = PersistentMap.withStringPrefix<string, string>('i:')
   }
 
   // ---- Names
@@ -151,24 +155,14 @@ export class IdenaProfile {
   claimName(args: NameArgs): void {
     this.checkFree(args.name)
     const caller = Context.caller()
-    askIdentity(caller, '_claimName', [caller.toBytes(), Bytes.fromString(args.name)], args._gas)
+    const state = this.knownState(caller)
+    if (state >= 0) this.doClaimName(caller, args.name, <u32>state)
+    else askIdentity(caller, '_claimName', [caller.toBytes(), Bytes.fromString(args.name)], args._gas)
   }
 
   @mutateState
   _claimName(holder: Address, name: string): void {
-    util.assert(canHoldName(promisedState()), 'not a validated identity')
-    this.checkFree(name)
-    const address = hex(holder)
-    const epoch = Context.epoch()
-    const old = this.names.get(address, '')
-    if (old != '') {
-      util.assert(parseEpoch(this.renamed.get(address, '0')) < epoch, 'one name change per epoch')
-      this.release(old, epoch)
-    }
-    this.holders.set(name, address)
-    this.names.set(address, name)
-    this.renamed.set(address, epochText(epoch))
-    Host.emitEvent('name', [holder.toBytes(), Bytes.fromString(name), Bytes.fromString(old)])
+    this.doClaimName(holder, name, this.promised(holder))
   }
 
   /** Drops the caller's name; it stays blocked for a while. */
@@ -186,24 +180,17 @@ export class IdenaProfile {
   /** Records that the holder of `name` is not validated (anyone may call it); a validated holder clears it. */
   @mutateState
   challengeName(args: NameArgs): void {
-    const holder = this.holders.get(args.name, '')
-    util.assert(holder != '', 'no such name')
-    askIdentity(Address.fromBytes(util.decodeFromHex(holder)), '_challengeName', [Bytes.fromString(args.name)], args._gas)
+    const holderHex = this.holders.get(args.name, '')
+    util.assert(holderHex != '', 'no such name')
+    const holder = Address.fromBytes(util.decodeFromHex(holderHex))
+    const state = this.knownState(holder)
+    if (state >= 0) this.doChallengeName(args.name, <u32>state)
+    else askIdentity(holder, '_challengeName', [holder.toBytes(), Bytes.fromString(args.name)], args._gas)
   }
 
   @mutateState
-  _challengeName(name: string): void {
-    const state = promisedState()
-    if (canHoldName(state)) {
-      this.challenges.delete(name)
-      Host.emitEvent('challenge', [Bytes.fromString(name), Bytes.fromString('')])
-      return
-    }
-    if (this.challenges.get(name, '') == '') {
-      const epoch = epochText(Context.epoch())
-      this.challenges.set(name, epoch)
-      Host.emitEvent('challenge', [Bytes.fromString(name), Bytes.fromString(epoch)])
-    }
+  _challengeName(holder: Address, name: string): void {
+    this.doChallengeName(name, this.promised(holder))
   }
 
   /** Frees a challenged name GRACE_EPOCHS after the challenge if its holder is still not validated. */
@@ -212,22 +199,15 @@ export class IdenaProfile {
     const since = this.challenges.get(args.name, '')
     util.assert(since != '', 'not challenged')
     util.assert(Context.epoch() >= parseEpoch(since) + GRACE_EPOCHS, 'the grace is not over')
-    const holder = this.holders.get(args.name, '')
-    askIdentity(Address.fromBytes(util.decodeFromHex(holder)), '_releaseName', [Bytes.fromString(args.name)], args._gas)
+    const holder = Address.fromBytes(util.decodeFromHex(this.holders.get(args.name, '')))
+    const state = this.knownState(holder)
+    if (state >= 0) this.doReleaseName(args.name, <u32>state)
+    else askIdentity(holder, '_releaseName', [holder.toBytes(), Bytes.fromString(args.name)], args._gas)
   }
 
   @mutateState
-  _releaseName(name: string): void {
-    const state = promisedState()
-    this.challenges.delete(name)
-    if (canHoldName(state)) {
-      Host.emitEvent('challenge', [Bytes.fromString(name), Bytes.fromString('')])
-      return
-    }
-    const holder = this.holders.get(name, '')
-    this.holders.delete(name)
-    this.names.delete(holder)
-    Host.emitEvent('released', [Bytes.fromString(name), Bytes.fromString(holder)])
+  _releaseName(holder: Address, name: string): void {
+    this.doReleaseName(name, this.promised(holder))
   }
 
   // ---- Profile
@@ -237,24 +217,20 @@ export class IdenaProfile {
   setProfile(args: ProfileArgs): void {
     this.checkProfile(args.bio, args.picture)
     const caller = Context.caller()
-    askIdentity(
-      caller,
-      '_setProfile',
-      [caller.toBytes(), Bytes.fromString(args.bio), Bytes.fromString(args.picture)],
-      args._gas
-    )
+    const state = this.knownState(caller)
+    if (state >= 0) this.doSetProfile(caller, args.bio, args.picture, <u32>state)
+    else
+      askIdentity(
+        caller,
+        '_setProfile',
+        [caller.toBytes(), Bytes.fromString(args.bio), Bytes.fromString(args.picture)],
+        args._gas
+      )
   }
 
   @mutateState
   _setProfile(holder: Address, bio: string, picture: string): void {
-    util.assert(canHoldName(promisedState()), 'not a validated identity')
-    this.checkProfile(bio, picture)
-    const address = hex(holder)
-    if (bio == '') this.bios.delete(address)
-    else this.bios.set(address, bio)
-    if (picture == '') this.pictures.delete(address)
-    else this.pictures.set(address, picture)
-    Host.emitEvent('profile', [holder.toBytes(), Bytes.fromString(bio), Bytes.fromString(picture)])
+    this.doSetProfile(holder, bio, picture, this.promised(holder))
   }
 
   // ---- Trust
@@ -265,17 +241,14 @@ export class IdenaProfile {
     util.assert(validTarget(args.target), 'not an address or a topic')
     const caller = Context.caller()
     util.assert(args.target != hex(caller), 'cannot trust oneself')
-    askIdentity(caller, '_trust', [caller.toBytes(), Bytes.fromString(args.target)], args._gas)
+    const state = this.knownState(caller)
+    if (state >= 0) this.doTrust(caller, args.target, <u32>state)
+    else askIdentity(caller, '_trust', [caller.toBytes(), Bytes.fromString(args.target)], args._gas)
   }
 
   @mutateState
   _trust(giver: Address, target: string): void {
-    util.assert(canTrust(promisedState()), 'not a validated identity')
-    const key = target + ':' + hex(giver)
-    util.assert(this.trusts.get(key, '') == '', 'already trusted')
-    this.trusts.set(key, epochText(Context.epoch()))
-    this.counts.set(target, (U64.parseInt(this.counts.get(target, '0')) + 1).toString())
-    Host.emitEvent('trust', [giver.toBytes(), Bytes.fromString(target)])
+    this.doTrust(giver, target, this.promised(giver))
   }
 
   /** Takes a Trust back. */
@@ -289,6 +262,89 @@ export class IdenaProfile {
     if (count <= 1) this.counts.delete(args.target)
     else this.counts.set(args.target, (count - 1).toString())
     Host.emitEvent('untrust', [caller.toBytes(), Bytes.fromString(args.target)])
+  }
+
+  // ---- What each call does once the identity state is known
+
+  private doClaimName(holder: Address, name: string, state: u32): void {
+    util.assert(canHoldName(state), 'not a validated identity')
+    this.checkFree(name)
+    const address = hex(holder)
+    const epoch = Context.epoch()
+    const old = this.names.get(address, '')
+    if (old != '') {
+      util.assert(parseEpoch(this.renamed.get(address, '0')) < epoch, 'one name change per epoch')
+      this.release(old, epoch)
+    }
+    this.holders.set(name, address)
+    this.names.set(address, name)
+    this.renamed.set(address, epochText(epoch))
+    Host.emitEvent('name', [holder.toBytes(), Bytes.fromString(name), Bytes.fromString(old)])
+  }
+
+  private doChallengeName(name: string, state: u32): void {
+    if (canHoldName(state)) {
+      this.challenges.delete(name)
+      Host.emitEvent('challenge', [Bytes.fromString(name), Bytes.fromString('')])
+      return
+    }
+    if (this.challenges.get(name, '') == '') {
+      const epoch = epochText(Context.epoch())
+      this.challenges.set(name, epoch)
+      Host.emitEvent('challenge', [Bytes.fromString(name), Bytes.fromString(epoch)])
+    }
+  }
+
+  private doReleaseName(name: string, state: u32): void {
+    this.challenges.delete(name)
+    if (canHoldName(state)) {
+      Host.emitEvent('challenge', [Bytes.fromString(name), Bytes.fromString('')])
+      return
+    }
+    const holder = this.holders.get(name, '')
+    this.holders.delete(name)
+    this.names.delete(holder)
+    Host.emitEvent('released', [Bytes.fromString(name), Bytes.fromString(holder)])
+  }
+
+  private doSetProfile(holder: Address, bio: string, picture: string, state: u32): void {
+    util.assert(canHoldName(state), 'not a validated identity')
+    this.checkProfile(bio, picture)
+    const address = hex(holder)
+    if (bio == '') this.bios.delete(address)
+    else this.bios.set(address, bio)
+    if (picture == '') this.pictures.delete(address)
+    else this.pictures.set(address, picture)
+    Host.emitEvent('profile', [holder.toBytes(), Bytes.fromString(bio), Bytes.fromString(picture)])
+  }
+
+  private doTrust(giver: Address, target: string, state: u32): void {
+    util.assert(canTrust(state), 'not a validated identity')
+    const key = target + ':' + hex(giver)
+    util.assert(this.trusts.get(key, '') == '', 'already trusted')
+    this.trusts.set(key, epochText(Context.epoch()))
+    this.counts.set(target, (U64.parseInt(this.counts.get(target, '0')) + 1).toString())
+    Host.emitEvent('trust', [giver.toBytes(), Bytes.fromString(target)])
+  }
+
+  // ---- Identity states, read once per epoch
+
+  /**
+   * The identity state of `address` read earlier in this epoch, or -1. States change at a validation (a new epoch),
+   * except a termination in the middle of one: a terminated identity keeps its state here until the epoch ends.
+   */
+  private knownState(address: Address): i32 {
+    const saved = this.identities.get(hex(address), '')
+    const colon = saved.indexOf(':')
+    if (colon < 0 || parseEpoch(saved.slice(0, colon)) != Context.epoch()) return -1
+    return <i32>U32.parseInt(saved.slice(colon + 1))
+  }
+
+  /** The state the identity promise gave for `address`, kept for the rest of the epoch. */
+  private promised(address: Address): u32 {
+    const state = promisedState()
+    this.identities.set(hex(address), epochText(Context.epoch()) + ':' + state.toString())
+    return state
   }
 
   // ---- Checks

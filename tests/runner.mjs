@@ -44,7 +44,14 @@ async function account(state) {
   return address
 }
 
+/** A state change, as a validation makes it: with a new epoch (the contract reads states once per epoch). */
 async function setState(address, state) {
+  await rpc('chain_setIdentity', [address, state])
+  await setEpoch(epoch + 1)
+}
+
+/** A state change in the middle of an epoch (a termination). */
+async function setStateNow(address, state) {
   await rpc('chain_setIdentity', [address, state])
   await block()
 }
@@ -228,6 +235,38 @@ await call(second, 'trust', {target: person})
 check('a second giver: the count is 2', (await read('k:', person)) === '2')
 await call(giver, 'untrust', {target: person})
 check('one untrusts: the count is 1, the other Trust stays', (await read('k:', person)) === '1' && (await read('t:', `${person}:${second}`)) !== null)
+
+// ---- 7. The identity state read once per epoch
+console.log('\n== 7. The identity state read once per epoch')
+await setEpoch(epoch + 1)
+const cached = await account(S.Human)
+const t1 = await account(S.Human)
+const t2 = await account(S.Human)
+const t3 = await account(S.Human)
+const first = await call(cached, 'trust', {target: t1})
+const laterCall = await call(cached, 'trust', {target: t2})
+const gas = (r) => Number(r.receipt.gasUsed)
+check(
+  `the second call in an epoch asks no identity: ${gas(laterCall)} gas against ${gas(first)}`,
+  first.ok && laterCall.ok && gas(laterCall) < gas(first) * 0.6 && (await read('i:', cached)) === `${epoch}:${S.Human}`,
+  `${first.errors} ${laterCall.errors}`
+)
+await setStateNow(cached, S.Killed)
+c = await call(cached, 'trust', {target: t3})
+check('terminated in the middle of the epoch: its state read earlier in the epoch still counts', c.ok, c.errors.join('; '))
+await call(cached, 'untrust', {target: t3})
+await setEpoch(epoch + 1)
+c = await call(cached, 'trust', {target: t3})
+check('the next epoch reads it again: refused', !c.ok && (await read('k:', t3)) === null, c.errors.join('; '))
+const refused = await account(S.Candidate)
+c = await call(refused, 'trust', {target: t1})
+check('a refused call keeps nothing: the next one asks again', !c.ok && (await read('i:', refused)) === null, c.errors.join('; '))
+const holderC = await account(S.Human)
+await call(holderC, 'claimName', {name: 'cache_holder'})
+c = await call(dave, 'challengeName', {name: 'cache_holder'})
+check('a challenge uses the holder state read in this epoch', c.ok && (await read('c:', 'cache_holder')) === null, c.errors.join('; '))
+const costs = {first: gas(first), again: gas(laterCall)}
+console.log(`  gas: first call of an epoch ${costs.first}, later calls ${costs.again}`)
 
 console.log(`\n${failures === 0 ? 'ALL PASSED' : `${failures} FAILED`} (${cases} checks)`)
 process.exitCode = failures === 0 ? 0 : 1
