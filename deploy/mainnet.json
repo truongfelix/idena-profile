@@ -1,0 +1,13 @@
+{
+  "contract": "0xd558483330925f169bbe692d8ea15b2faa83c17f",
+  "tx": "0x4c6f896a1b45c67c71719d6f2b8b6057afa117375867bada6424dce5a3368286",
+  "blockHash": "0x4c08010b1e4e0bae5ad0e2a04b832109d25b3f74941b24db3cbb9e20d3c6bcb7",
+  "nonce": "0xbef3785c8da4a274",
+  "deployer": "0x022353d8a3e5852f2eb8df3e23a7b0f738752536",
+  "sha256": "05719792d5386f7f02ec12d333d5cddf5bcfe5f6851d3a312d2647e346cd05aa",
+  "gasUsed": 30332,
+  "txFee": "50.37168141590704",
+  "gasCost": "2.6842477876094384",
+  "time": "2026-10-16 22:23:19 CEST",
+  "answers": true
+}
