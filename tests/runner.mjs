@@ -482,6 +482,20 @@ check("a stranger cannot end someone else's vouch", !c.ok && (await read('v:', l
 c = await call(leaver, 'endVouch', {member: ''})
 check('a member may leave on its own', c.ok && (await read('v:', leaver)) === null, c.errors.join('; '))
 
+console.log('-- a member who validated, still listed with its voucher')
+// The contract reads the extra amount until it read the identity in this epoch: the apps send it (memberExtraFor).
+const grew2 = await account()
+await call(voucher, 'vouch', {member: grew2})
+await call(grew2, 'acceptVouch', {voucher})
+await setState(grew2, S.Newbie)
+c = await call(grew2, 'trust', {target: someone}, '0', {crash: true})
+check('without the amount: a crash in the VM, still listed', !c.ok && (await read('v:', grew2)) === voucher, c.errors.join('; '))
+check("its voucher's slot stays taken meanwhile", (await read('q:', voucher)) === '1')
+c = await call(grew2, 'endVouch', {member: ''})
+check('ending the vouch reads no amount and frees the slot', c.ok && (await read('v:', grew2)) === null && (await read('q:', voucher)) === null, c.errors.join('; '))
+c = await call(grew2, 'trust', {target: someone})
+check('then it acts on its own identity, without the amount', c.ok && (await read('t:', `${someone}:${grew2}`)) === String(epoch), c.errors.join('; '))
+
 // ---- 9. _keepGas: the gas reserved for a state read before the callback that acts
 console.log('\n== 9. _keepGas: the reservation of each _keepState')
 // New accounts: their states are not read yet in this epoch, so accepting asks for two (member, then voucher).
