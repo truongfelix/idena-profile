@@ -147,11 +147,6 @@ function promisedState(): u32 {
   return identity.state
 }
 
-/** A call that needs no amount refuses one: the contract has no way to give it back. */
-function noPayment(): void {
-  util.assert(Context.payAmount().value.isZero(), 'this call takes no amount')
-}
-
 /** The first epoch of a saved challenge, "<since>:<last>:<holder>". */
 function challengeSince(saved: string): u16 {
   return parseEpoch(saved.slice(0, saved.indexOf(':')))
@@ -242,7 +237,6 @@ export class IdenaProfile {
   /** Drops the caller's name; it stays blocked for a while. */
   @mutateState
   dropName(): void {
-    noPayment()
     const caller = Context.caller()
     const address = hex(caller)
     const name = maps.names.get(address, '')
@@ -322,7 +316,6 @@ export class IdenaProfile {
   /** Takes a Trust back. */
   @mutateState
   untrust(args: TrustArgs): void {
-    noPayment()
     const caller = Context.caller()
     const key = args.target + ':' + hex(caller)
     const given = maps.trusts.get(key, '')
@@ -337,7 +330,6 @@ export class IdenaProfile {
   /** Offers to vouch for `member`, an account without an identity; it becomes a vouch once the member accepts it. */
   @mutateState
   vouch(args: MemberArgs): void {
-    noPayment()
     util.assert(validAddress(args.member), 'not an address')
     const caller = Context.caller()
     util.assert(args.member != hex(caller), 'cannot vouch for oneself')
@@ -355,7 +347,6 @@ export class IdenaProfile {
   /** Accepts a vouch offered to the caller. */
   @mutateState
   acceptVouch(args: VoucherArgs): void {
-    noPayment()
     util.assert(validAddress(args.voucher), 'not an address')
     const caller = Context.caller()
     util.assert(maps.offers.get(hex(caller) + ':' + args.voucher, '') != '', 'no such offer')
@@ -378,7 +369,6 @@ export class IdenaProfile {
    */
   @mutateState
   endVouch(args: MemberArgs): void {
-    noPayment()
     const caller = hex(Context.caller())
     const member = args.member == '' ? caller : args.member
     const voucher = maps.vouchers.get(member, '')
@@ -389,7 +379,6 @@ export class IdenaProfile {
   /** The voucher withdraws an offer not accepted yet. An offer takes no slot: the cap counts accepted vouches. */
   @mutateState
   cancelOffer(args: MemberArgs): void {
-    noPayment()
     const caller = Context.caller()
     const key = args.member + ':' + hex(caller)
     util.assert(maps.offers.get(key, '') != '', 'no such offer')
@@ -400,7 +389,6 @@ export class IdenaProfile {
   /** The member refuses an offer. */
   @mutateState
   declineOffer(args: VoucherArgs): void {
-    noPayment()
     const caller = Context.caller()
     const key = hex(caller) + ':' + args.voucher
     util.assert(maps.offers.get(key, '') != '', 'no such offer')
@@ -521,18 +509,13 @@ export class IdenaProfile {
 
   /**
    * A vouched member's call (one with a voucher and no identity known to allow it) burns what it sends, at least
-   * about one more call's fee.
+   * about one more call's fee. Any other call never reads the amount: on a node, a call sent without one carries
+   * none, and reading it fails in the VM (pay_amount). An amount sent by mistake stays in the contract.
    */
   private payIfVouched(account: Address): void {
-    if (maps.vouchers.get(hex(account), '') == '') {
-      noPayment()
-      return
-    }
+    if (maps.vouchers.get(hex(account), '') == '') return
     const state = this.knownState(account)
-    if (state >= 0 && !vouchable(<u32>state)) {
-      noPayment()
-      return
-    }
+    if (state >= 0 && !vouchable(<u32>state)) return
     const paid = Context.payAmount()
     util.assert(paid >= vouchedExtra(), 'a vouched member sends about one more fee with each call')
     Host.burn(paid)

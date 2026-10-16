@@ -62,6 +62,8 @@ async function call(who, method, arg) {
   }
   walk(r.actionResult)
   const errors = actions.filter((a) => !a.success).map((a) => `${a.inputAction?.method || a.inputAction?.actionType}: ${a.error}`)
+  // A crash in the VM (reading the amount of a call sent without one) is never a refusal.
+  if (errors.some((e) => e.includes('backend error in env method'))) check(`${method}: no crash in the VM`, false, errors.join('; '))
   return {r, events: (r.events || []).map((e) => e.event), errors, ok: r.success && errors.length === 0}
 }
 
