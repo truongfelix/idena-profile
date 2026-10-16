@@ -43,6 +43,11 @@ const HUMAN: u32 = 8
 
 const IDENTITY_GAS: u32 = 20_000
 const DEFAULT_CALLBACK_GAS: u32 = 10_000_000
+/**
+ * The gas (WASM) of a callback that only keeps an identity state read before the one that acts (_keepState): the
+ * default of each call's `_keepGas`. The apps size it from a dry run, as `_gas`: the node reserves it out of the
+ * call's gas limit, which the caller's balance covers.
+ */
 const KEEP_STATE_GAS: u32 = 10_000_000
 
 /**
@@ -160,27 +165,32 @@ function vouchedExtra(): Balance {
 class NameArgs {
   name: string = ''
   _gas: u32 = DEFAULT_CALLBACK_GAS
+  _keepGas: u32 = KEEP_STATE_GAS
 }
 
 class ProfileArgs {
   bio: string = ''
   picture: string = ''
   _gas: u32 = DEFAULT_CALLBACK_GAS
+  _keepGas: u32 = KEEP_STATE_GAS
 }
 
 class TrustArgs {
   target: string = ''
   _gas: u32 = DEFAULT_CALLBACK_GAS
+  _keepGas: u32 = KEEP_STATE_GAS
 }
 
 class MemberArgs {
   member: string = ''
   _gas: u32 = DEFAULT_CALLBACK_GAS
+  _keepGas: u32 = KEEP_STATE_GAS
 }
 
 class VoucherArgs {
   voucher: string = ''
   _gas: u32 = DEFAULT_CALLBACK_GAS
+  _keepGas: u32 = KEEP_STATE_GAS
 }
 
 /** How an account acts: on its own identity, as a vouched member, or not at all. */
@@ -224,7 +234,7 @@ export class IdenaProfile {
     this.checkFree(args.name)
     const caller = Context.caller()
     this.payIfVouched(caller)
-    if (this.ensureKnown(this.withVoucher(caller), '_claimName', [caller.toBytes(), Bytes.fromString(args.name)], args._gas))
+    if (this.ensureKnown(this.withVoucher(caller), '_claimName', [caller.toBytes(), Bytes.fromString(args.name)], args._gas, args._keepGas))
       this.doClaimName(caller, args.name)
   }
 
@@ -265,7 +275,7 @@ export class IdenaProfile {
       const own = this.withVoucher(caller)
       for (let i = 0; i < own.length; i++) accounts.push(own[i])
     }
-    if (this.ensureKnown(accounts, '_challengeName', [caller.toBytes(), Bytes.fromString(args.name)], args._gas))
+    if (this.ensureKnown(accounts, '_challengeName', [caller.toBytes(), Bytes.fromString(args.name)], args._gas, args._keepGas))
       this.doChallengeName(caller, args.name)
   }
 
@@ -284,7 +294,7 @@ export class IdenaProfile {
     const caller = Context.caller()
     this.payIfVouched(caller)
     const callArgs = [caller.toBytes(), Bytes.fromString(args.bio), Bytes.fromString(args.picture)]
-    if (this.ensureKnown(this.withVoucher(caller), '_setProfile', callArgs, args._gas))
+    if (this.ensureKnown(this.withVoucher(caller), '_setProfile', callArgs, args._gas, args._keepGas))
       this.doSetProfile(caller, args.bio, args.picture)
   }
 
@@ -303,7 +313,7 @@ export class IdenaProfile {
     const caller = Context.caller()
     util.assert(args.target != hex(caller), 'cannot trust oneself')
     this.payIfVouched(caller)
-    if (this.ensureKnown(this.withVoucher(caller), '_trust', [caller.toBytes(), Bytes.fromString(args.target)], args._gas))
+    if (this.ensureKnown(this.withVoucher(caller), '_trust', [caller.toBytes(), Bytes.fromString(args.target)], args._gas, args._keepGas))
       this.doTrust(caller, args.target)
   }
 
@@ -334,7 +344,7 @@ export class IdenaProfile {
     const caller = Context.caller()
     util.assert(args.member != hex(caller), 'cannot vouch for oneself')
     util.assert(maps.vouchers.get(args.member, '') != hex(caller), 'already vouched for')
-    if (this.ensureKnown([caller], '_vouch', [caller.toBytes(), Bytes.fromString(args.member)], args._gas))
+    if (this.ensureKnown([caller], '_vouch', [caller.toBytes(), Bytes.fromString(args.member)], args._gas, args._keepGas))
       this.doVouch(caller, args.member)
   }
 
@@ -352,7 +362,7 @@ export class IdenaProfile {
     util.assert(maps.offers.get(hex(caller) + ':' + args.voucher, '') != '', 'no such offer')
     util.assert(maps.vouchers.get(hex(caller), '') == '', 'already vouched for')
     const voucher = addressOf(args.voucher)
-    if (this.ensureKnown([caller, voucher], '_acceptVouch', [caller.toBytes(), voucher.toBytes()], args._gas))
+    if (this.ensureKnown([caller, voucher], '_acceptVouch', [caller.toBytes(), voucher.toBytes()], args._gas, args._keepGas))
       this.doAcceptVouch(caller, voucher)
   }
 
@@ -573,7 +583,7 @@ export class IdenaProfile {
    * Asks the node for the states of `accounts` not read yet in this epoch; the last answer's callback (`callback`,
    * with the asked address then `args`) acts. True when all are known already: the caller acts at once.
    */
-  private ensureKnown(accounts: Address[], callback: string, args: Bytes[], gas: u32): bool {
+  private ensureKnown(accounts: Address[], callback: string, args: Bytes[], gas: u32, keepGas: u32): bool {
     const unknown: Address[] = []
     for (let i = 0; i < accounts.length; i++) {
       let again = false
@@ -589,7 +599,7 @@ export class IdenaProfile {
         last ? callback : '_keepState',
         callArgs,
         Balance.Zero,
-        last ? gas : KEEP_STATE_GAS
+        last ? gas : keepGas
       )
     }
     return false

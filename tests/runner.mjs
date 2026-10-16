@@ -482,5 +482,33 @@ check("a stranger cannot end someone else's vouch", !c.ok && (await read('v:', l
 c = await call(leaver, 'endVouch', {member: ''})
 check('a member may leave on its own', c.ok && (await read('v:', leaver)) === null, c.errors.join('; '))
 
+// ---- 9. _keepGas: the gas reserved for a state read before the callback that acts
+console.log('\n== 9. _keepGas: the reservation of each _keepState')
+// New accounts: their states are not read yet in this epoch, so accepting asks for two (member, then voucher).
+const keepUsed = (r) =>
+  (r.receipt.actionResult?.subActionResults || [])
+    .filter((a) => a.inputAction?.method === '_keepState')
+    .map((a) => a.gasUsed)
+const pair = async () => {
+  const v = await account(S.Human)
+  const m = await account()
+  const offer = await call(v, 'vouch', {member: m})
+  if (!offer.ok) throw new Error(`vouch: ${offer.errors.join('; ')}`)
+  // The offer read the voucher's state: a new epoch makes both unknown again.
+  await setEpoch(epoch + 1)
+  return [v, m]
+}
+let [v9, m9] = await pair()
+c = await call(m9, 'acceptVouch', {voucher: v9, _keepGas: 1_000_000})
+const used = keepUsed(c)
+check('a _keepGas of 1,000,000 is enough: the member accepts', c.ok && used.length === 1 && (await read('v:', m9)) === v9, `${c.errors.join('; ')} used ${used}`)
+console.log(`  _keepState used ${used} WASM gas (${used.map((u) => Math.ceil(u / 100))} gas) of the 1,000,000 asked`)
+;[v9, m9] = await pair()
+c = await call(m9, 'acceptVouch', {voucher: v9, _keepGas: 1000})
+// Starved, _keepState fails (the VM cannot even start it): the state stays unknown, and the callback that acts refuses.
+check('a _keepGas too small for _keepState: refused, nothing written', has(c, 'identity not read') && (await read('v:', m9)) === null, c.errors.join('; '))
+c = await call(m9, 'acceptVouch', {voucher: v9})
+check('without _keepGas, the default works', c.ok && (await read('v:', m9)) === v9, c.errors.join('; '))
+
 console.log(`\n${failures === 0 ? 'ALL PASSED' : `${failures} FAILED`} (${cases} checks)`)
 process.exitCode = failures === 0 ? 0 : 1
