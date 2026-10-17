@@ -30,6 +30,10 @@ The sha256 is the one above (built with Node 20 and 24; AssemblyScript 0.27.37, 
 `package-lock.json`). Compare it with the code stored on chain: the deploy transaction's payload, or
 `api.idena.io/api/Contract/<address>`'s `code`.
 
+`scripts/check-deployed-build.sh` (after `npm ci`) builds the current source and compares it with this sha256; CI
+runs it on every push to `main` and every pull request. It fails on any change to the contract's code: a new version
+would be a new contract, with its own deployment record.
+
 ## The rules
 
 - **Names:** a-z, 0-9 and `_`, 3 to 20 characters, one per address, kept with no renewal while the holder validates
